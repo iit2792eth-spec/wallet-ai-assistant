@@ -1,0 +1,272 @@
+Task: Implement the Text Decoder
+1. Context and role
+The Text Decoder sits between the AI Layer and the Access Layer:
+User Interface -> Text Encoder -> AI Layer -> Text Decoder -> Access Layer -> Wallet Layer
+The Text Encoder replaces secrets in the user's prompt with placeholders before the prompt reaches the LLM, and keeps the original values in a local mapping. The AI Layer therefore works on sanitized text, and the Action Proposals it generates can contain those placeholders. The Text Decoder's job is to validate the AI Layer's output and restore wallet address placeholders only from the local mapping, then forward the decoded proposals to the Access Layer.
+The Text Decoder is a deterministic layer. It operates only on predefined placeholder patterns, the structured JSON result, and the local mapping. It must not use AI, semantic interpretation, or guesswork to reconstruct original values. It does not judge whether a proposal is safe or authorized; that is the Access Layer's job (intent validation, permission checks, transaction construction, simulation, and so on).
+2. Input
+The AI Layer returns one of three JSON result types. Only the first passes through the Text Decoder; clarification and rejection results go straight back to the user interface.
+{"type": "proposals", "proposals": [ActionProposal, ...]}
+{"type": "clarification", "missing": ["amount", "unit"], "question": "..."}
+{"type": "rejection", "reason": "...", "message": "..."}
+
+Action Proposal schema (what the decoder receives)
+Every proposal has these common fields:
+Field
+Description
+action
+One of: tx, chck_blnc, tx_hstry, off_sign, uni_swp, ens_res
+order
+Integer. 1 is executed first, then 2, 3, and so on. Across a list the values must be exactly 1..N with no gaps or duplicates.
+origin
+"user" or "external"
+origin_detail
+URL or filename, or null
+chain_id
+As the user wrote it, or null
+chain_name
+As the user wrote it, or null
+
+Fields per action (fields that do not apply are null):
+Action
+Fields
+tx
+recipient_name, recipient_wallet_adr, amount, unit
+chck_blnc
+address (null = the user's own wallet), unit (optional asset)
+tx_hstry
+address (null = the user's own wallet), limit (optional number of transactions)
+ens_res
+name (forward lookup) or address (reverse lookup)
+uni_swp
+token_in, token_out, amount, unit (the unit of amount)
+off_sign
+template_id, params
+
+For tx, the user fills whichever of recipient_name / recipient_wallet_adr they specified (both if both were given) and the other is null. Supported units: ETH, USDC, EURC, WEI, GWEI. Amounts are decimal strings.
+3. Placeholders
+The decoder identifies these formats using regex matching:
+Type
+Format
+Regex
+Wallet address
+[WALLET_ADDRESS_N]
+\[WALLET_ADDRESS_\d+\]
+Private key
+[PRIVATE_KEY_N]
+\[PRIVATE_KEY_\d+\]
+Seed phrase
+[SEED_PHRASE_N]
+\[SEED_PHRASE_\d+\]
+
+Only wallet address placeholders may be restored. Private keys and seed phrases must NEVER be restored and must never enter the proposal pipeline.
+[TO CONFIRM: the Text Encoder spec must use exactly these placeholder formats. Update the Text Encoder section of the AI-layer prompt so both match.]
+Fields eligible for wallet-address restoration
+Action
+Eligible fields
+tx
+recipient_wallet_adr
+chck_blnc
+address
+tx_hstry
+address
+ens_res
+address
+uni_swp
+token_in, token_out (a token given by name or symbol stays unchanged; a token given as an address was replaced by the encoder and is restored here)
+off_sign
+any string value inside params, at any depth
+
+In every other field (including recipient_name, name, amount, unit, limit, template_id, chain_id, chain_name, origin_detail, action), nothing is restored. A placeholder of any type in an ineligible field is an error (see section 5).
+A placeholder in an eligible field must be the entire field value. A placeholder embedded in a longer string is an error.
+4. Decoding logic
+For a result with "type": "proposals":
+Validate the whole result against the schema in section 2. Reject on any unknown field, unknown action keyword, unsupported unit, wrong type, or order values that are not exactly 1..N. Never repair anything by guessing.
+For each proposal, scan every field for placeholders with the regexes above.
+If a private-key or seed-phrase placeholder appears anywhere, reject (it must never be restored).
+If a wallet address placeholder appears in an ineligible field, reject.
+For each wallet address placeholder in an eligible field, look it up in the local mapping. If it is found, replace it with the original address. If it is not found, reject (do not generate a replacement).
+Leave every null field as null.
+Leave all other values unchanged: names, symbols, ENS names, amounts, units, chain fields, order, origin, origin_detail, template_id, limit.
+Output the decoded result in the same shape to the Access Layer.
+The decoder does not resolve ENS names, convert a recipient name to an address, resolve chain names to IDs, or touch slippage and other swap parameters (the Access Layer does that using its configured defaults). It does not generate or reconstruct raw EIP-712 typed data; the Access Layer selects the registered template, validates its parameters, and builds the typed data.
+All-or-nothing: if any proposal in the list fails, reject the whole result. Never forward a partially decoded list.
+5. Rejections
+Decoder errors use the same shape as other rejections:
+{"type": "rejection", "reason": "schema_violation | unknown_placeholder | forbidden_placeholder | placeholder_in_ineligible_field", "message": "..."}
+The message is shown to the user, so it must never contain a restored secret or the contents of the mapping. Detailed diagnostics go to a redacted log.
+Situation
+Result
+Wallet address placeholder found in the mapping, in an eligible field
+Restore
+Wallet address placeholder not in the mapping
+Reject: unknown_placeholder
+Private key or seed phrase placeholder anywhere
+Reject: forbidden_placeholder
+Any placeholder in an ineligible field
+Reject: placeholder_in_ineligible_field
+Output does not match the schema
+Reject: schema_violation
+Null field
+Preserve unchanged
+
+An unknown placeholder means the model returned a placeholder the Text Encoder never generated. Treat it as a fabricated or tampered value, not a typo.
+6. Examples
+Local mapping used in the examples (generated by the Text Encoder):
+{
+  "[WALLET_ADDRESS_1]": "0x1234567890123456789012345678901234567890",
+  "[WALLET_ADDRESS_2]": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+}
+Example 1: Transaction to a wallet address
+AI Layer output:
+{
+  "type": "proposals",
+  "proposals": [
+    {
+      "action": "tx",
+      "order": 1,
+      "origin": "user",
+      "origin_detail": null,
+      "chain_id": null,
+      "chain_name": "Sepolia",
+      "recipient_name": null,
+      "recipient_wallet_adr": "[WALLET_ADDRESS_2]",
+      "amount": "0.5",
+      "unit": "ETH"
+    }
+  ]
+}
+Decoder output (only recipient_wallet_adr changes):
+{
+  "type": "proposals",
+  "proposals": [
+    {
+      "action": "tx",
+      "order": 1,
+      "origin": "user",
+      "origin_detail": null,
+      "chain_id": null,
+      "chain_name": "Sepolia",
+      "recipient_name": null,
+      "recipient_wallet_adr": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      "amount": "0.5",
+      "unit": "ETH"
+    }
+  ]
+}
+Example 2: Transaction to a name
+The user said "send 10 USDC to Anuneet on chain 11155111". There is no address, so there is nothing to restore. The decoder does not resolve the name.
+Input proposal and output proposal are identical:
+{
+  "action": "tx",
+  "order": 1,
+  "origin": "user",
+  "origin_detail": null,
+  "chain_id": "11155111",
+  "chain_name": null,
+  "recipient_name": "Anuneet",
+  "recipient_wallet_adr": null,
+  "amount": "10",
+  "unit": "USDC"
+}
+Example 3: Transaction with both a name and an address
+The user said "send 1 ETH to Ravi, 0x1234..." (the encoder replaced the address with [WALLET_ADDRESS_1]).
+AI Layer proposal:
+{
+  "action": "tx",
+  "order": 1,
+  "origin": "user",
+  "origin_detail": null,
+  "chain_id": null,
+  "chain_name": "Sepolia",
+  "recipient_name": "Ravi",
+  "recipient_wallet_adr": "[WALLET_ADDRESS_1]",
+  "amount": "1",
+  "unit": "ETH"
+}
+Decoded: recipient_name stays "Ravi", and recipient_wallet_adr becomes "0x1234567890123456789012345678901234567890". The decoder does not check that the name and the address belong together.
+Example 4: Check balance of an address
+AI Layer proposal:
+{
+  "action": "chck_blnc",
+  "order": 1,
+  "origin": "user",
+  "origin_detail": null,
+  "chain_id": null,
+  "chain_name": "Sepolia",
+  "address": "[WALLET_ADDRESS_1]",
+  "unit": "ETH"
+}
+Decoded: address becomes "0x1234567890123456789012345678901234567890"; everything else unchanged. The decoder does not decide whether this is the user's own wallet; the Access Layer allows only the user's own wallet and rejects other addresses.
+Example 5: Check own wallet balance
+AI Layer proposal:
+{
+  "action": "chck_blnc",
+  "order": 1,
+  "origin": "user",
+  "origin_detail": null,
+  "chain_id": "11155111",
+  "chain_name": null,
+  "address": null,
+  "unit": "ETH"
+}
+Decoded output is identical. Because address is null, the decoder does no replacement, and the Access Layer reads null as "use the user's own wallet".
+Example 6: Two independent operations
+The user said "send 0.5 ETH to 0xabcd... and check my balance, on Sepolia" (independent, so the AI Layer accepts it).
+AI Layer output:
+{
+  "type": "proposals",
+  "proposals": [
+    {
+      "action": "tx",
+      "order": 1,
+      "origin": "user",
+      "origin_detail": null,
+      "chain_id": null,
+      "chain_name": "Sepolia",
+      "recipient_name": null,
+      "recipient_wallet_adr": "[WALLET_ADDRESS_2]",
+      "amount": "0.5",
+      "unit": "ETH"
+    },
+    {
+      "action": "chck_blnc",
+      "order": 2,
+      "origin": "user",
+      "origin_detail": null,
+      "chain_id": null,
+      "chain_name": "Sepolia",
+      "address": null,
+      "unit": null
+    }
+  ]
+}
+Decoded: proposal 1 gets recipient_wallet_adr restored to "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"; proposal 2 is unchanged. order is preserved.
+Example 7: Unknown placeholder (reject)
+The model returns "recipient_wallet_adr": "[WALLET_ADDRESS_9]", but the mapping has no entry for it.
+{"type": "rejection", "reason": "unknown_placeholder", "message": "The request could not be processed because it referenced a value that was not recognised. Please try again."}
+Example 8: Private key placeholder (reject)
+Any proposal containing [PRIVATE_KEY_1] or [SEED_PHRASE_1] in any field.
+{"type": "rejection", "reason": "forbidden_placeholder", "message": "The request could not be processed. Secrets are never used in requests."}
+Example 9: Placeholder in an ineligible field (reject)
+The model puts [WALLET_ADDRESS_1] in recipient_name. The decoder never moves values between fields.
+{"type": "rejection", "reason": "placeholder_in_ineligible_field", "message": "The request could not be processed because a value appeared in the wrong field. Please try again."}
+7. Security requirements
+The local mapping must never be passed to the LLM, the AI Layer, or any external service.
+The decoder accesses the mapping through a secure local interface only.
+The mapping is scoped to the current request or session and securely cleared when no longer needed.
+Secrets and restored values must not appear in logs; log redacted structured fields only.
+Private keys and seed phrases are never restored, forwarded, or logged.
+The decoder must be deterministic: the same input and mapping always give the same output.
+8. Tests to write
+Produce a runnable test suite with results written to results/*.json (or .md), covering:
+Correct restoration for each action's eligible fields, including params values at depth.
+Null fields preserved; names, symbols, amounts and chain fields unchanged.
+Multiple proposals with order preserved, and all-or-nothing rejection when only one proposal is bad.
+Unknown placeholder, private-key placeholder, seed-phrase placeholder, placeholder in an ineligible field, and placeholder embedded in a longer string: each rejected with the correct reason.
+Schema violations: extra fields, invented action keyword, unsupported unit, order gaps or duplicates, malformed JSON.
+Tampering: a model that returns a plausible address it was never given, or swaps one placeholder for another. Report what the decoder catches and what only the Access Layer can catch (for example, a valid placeholder swapped for a different valid placeholder).
+Mapping hygiene: mapping cleared after the session; nothing from it appears in logs or rejection messages.
+Report failures as well as successes, with a short explanation of why each failure happened.
+
+

@@ -1,0 +1,23 @@
+{
+  "test_id": {
+    "n": 426,
+    "TPR_detect": 94.84,
+    "FPR_all_clean": 0.0,
+    "FPR_hard_neg": 0.0,
+    "missed_injected": 11
+  },
+  "test_heldout": {
+    "n": 1243,
+    "TPR_detect": 75.96,
+    "FPR_all_clean": 3.54,
+    "FPR_hard_neg": 2.4,
+    "missed_injected": 163
+  },
+  "test_ood_crai": {
+    "n": 2233,
+    "TPR_detect": 94.88,
+    "FPR_all_clean": 3.36,
+    "FPR_hard_neg": null,
+    "missed_injected": 58
+  }
+}

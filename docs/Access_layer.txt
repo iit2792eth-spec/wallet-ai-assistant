@@ -1,0 +1,204 @@
+Task: Build the Access Layer
+
+1. Role and position
+
+Pipeline: UI -> Text Encoder -> AI Layer -> Text Decoder -> Access Layer -> Wallet Layer.
+
+The Access Layer receives the decoded code result from the Text Decoder (`text-decoder/`): a JavaScript program with placeholders already restored to real addresses and ENS names. It also receives the request's mode (`explain` | `prepare` | `sign`, from `runAiLayer`) and the session id.
+
+It is the only component that decides whether anything is read, prepared or signed. It:
+- validates the program
+- runs it in a QuickJS sandbox
+- implements every function the sandbox can call
+- checks every proposed action against policy
+- obtains the user's approval, or applies saved limits
+- calls the Wallet Layer (`wallet/`)
+- records what happened
+
+It is deterministic and uses no AI. Read `docs/AI_layer.txt` (sections 4.2–4.4) and `ai/manifest/function_manifest.json` before starting: the manifest is the contract between the generated code and this layer.
+
+Core rules:
+- The AI layer is untrusted, and so is the code. Every safety rule is enforced here in code.
+- Results of running the code (balances, history, hashes) go to the sandbox and the UI only. They never go to the AI layer or any model. At most, the AI session gets a one-word outcome (completed / cancelled / failed) with no values.
+- The Wallet Layer does no checks, so all checks happen here, before calling it.
+- No team-held keys and no unchecked signing: nothing is signed without passing policy and then either explicit approval or saved limits.
+
+2. Entry point
+
+One function: `runPlan({ sessionId, decoded, mode })`. Code goes in `access/`, alongside `app/`.
+
+`pipeline/handle-message.ts` calls it after a successful decode, in place of the "Nothing was run" status line. It returns when the program finishes, fails or times out. It never throws to the pipeline: every outcome is reported to the UI over the existing event bus (`events/`) and to the audit log.
+
+Allow one running plan per session. A new message while a plan is running or paused is refused with a clear message. When a session ends (`pipeline/session-lifecycle.ts`), cancel its paused plan and expire its pending approvals.
+
+3. Plan Validator (before anything runs)
+
+- Re-run the Code Verifier's deterministic AST checks (`ai/verifier/ast-checks.ts`) on the decoded code, adapted for decoded code:
+  - raw addresses are now expected
+  - any remaining placeholder is an error
+  - the call allowlist, forbidden constructs, bounded loops and amount rules all still apply
+- Reject if `functions_used` does not match the calls.
+- Refactor shared logic rather than duplicating it.
+- On failure: no sandbox run, an error message to the user, and an audit entry.
+
+4. QuickJS sandbox
+
+Use the quickjs-emscripten asyncify variant, so async host functions can pause the program; `await propose(...)` waits for the user. Never use Node's `vm`.
+
+The program is wrapped as `(async (wallet, ui, propose, unique, parseEther, parseUnits, formatUnits) => { <code> })`. The only globals are those listed in the manifest. There is no network, file system, timers, host objects or eval of host strings.
+
+Limits, each enforced and configurable in one config file:
+- memory, e.g. 32 MB
+- CPU time, e.g. 2 s of execution, excluding time spent waiting for the user or the network
+- total wall-clock time, including approval waits
+- maximum host calls
+- maximum `ui.show` calls, e.g. 20
+- maximum `propose` calls, e.g. 5
+- maximum actions per batch, e.g. 10
+
+Exceeding any limit stops the program with a clear reason.
+
+Values cross the boundary as JSON with BigInt tagged. Copy and freeze everything coming out of the sandbox before use, so the program cannot change an action after proposing it. Execute exactly the frozen, approved copy.
+
+The util functions (`unique`, `parseEther`, `parseUnits`, `formatUnits`) are pure, run inside the sandbox, and must match viem's results. Reuse the prelude in `ai/verifier/dry-run.ts` where possible.
+
+5. Host functions (the manifest's functions, implemented here)
+
+Each one checks its inputs, then calls the Wallet Layer. Malformed input throws a sandbox-visible error with a short reason; it is never passed on.
+
+| Function | Rules |
+|---|---|
+| `wallet.getBalance({ token, address? })` | Token in the allowlist. `address` omitted or equal to the user's own address; any other address is rejected before any RPC call, so it is never sent to a node. Returns a BigInt in base units. |
+| `wallet.getHistory({ limit?, direction? })` | Maps `wallet.getActivity` to the manifest's HistoryEntry shape. This app's actions only. Cap `limit`. |
+| `wallet.resolveEns(name)` / `wallet.lookupEns(address)` | Validate the name or address format, then call the Wallet Layer. Note in the README that lookups reveal the name or address to the mainnet RPC. |
+| `ui.show({ title?, text?, list? })` | Only these fields, strings only, with length and item caps. Sent to the UI as an `output` event, rendered as plain text. Never sent to a model. |
+| `propose(actions)` | See section 6. Returns `{ approved, status, results }`, where status is `approved`, `rejected`, `expired`, `blocked`, `explained` or `prepared`. `results` holds the per-action outcome: status, tx hash, and error code without private data. |
+
+6. propose(): validate, check policy, approve, execute
+
+6.1 Validate each action against the manifest's action schemas:
+- `transfer`: `to`, `token` (ETH/USDC/EURC), `amount` (BigInt > 0)
+- `sign_typed_data`: exactly one of `typedData` or `file`
+
+Reject unknown actions, unknown fields and wrong types.
+
+6.2 Resolve the recipient:
+- An ENS name goes through `wallet.resolveEns`. If it has no address, the action is blocked.
+- A name matching a saved contact (case-insensitive, exact) uses the contact's address. If there is no match or several matches, the action is blocked with a message asking the user to add the contact or use an address.
+- Keep both the label the user sees and the address.
+
+6.3 Provenance (taint) of each recipient. Untrusted recipients are never auto-approved and always carry a warning on the approval card.
+
+| Provenance | When |
+|---|---|
+| `user` | The address or ENS name was typed by the user in this session. Ask the encoder's vault; add a method that returns a value's source without exposing the mapping. |
+| `contact` | It matches a saved contact. |
+| `external` | It came from a web page or PDF (vault source web/pdf). |
+| `untrusted` | Anything else, including addresses read at run time from `getHistory` (address-poisoning risk) or computed by the program. |
+
+6.4 Policy, applied to the computed actions:
+- Token configured on the active network (a token with no contract on that network is blocked with a clear message).
+- Amount > 0, and no more than the current balance. For ETH, include the estimated gas.
+- Batch size within the cap. Per-token batch totals are checked against limits as a whole, not action by action.
+- Spend limits from the `spend_limits` table, per token:
+  - per transaction
+  - rolling 24 hours
+  - rolling 7 days
+
+  Totals are summed from the `actions` table (statuses approved, signed, submitted, confirmed) plus this batch.
+- The wallet exists and is unlocked when signing is needed. If locked, show the unlock prompt and continue after unlock, or treat it as an expired approval on timeout.
+- Typed data:
+  - The pasted object or file (absolute path, size cap, JSON) must be valid EIP-712, checked with viem.
+  - The domain `chainId` must equal the active chain, and an owner/from field that is present must equal the wallet address. A mismatch blocks.
+  - Recognise known types (EIP-2612 Permit, Permit2) and summarise them, e.g. "lets X spend up to Y USDC until DATE". Unknown types get a warning.
+  - Never auto-approve typed data.
+- A blocked batch is not executed at all, and the reason is shown to the user.
+
+6.5 Mode:
+
+| Mode | What propose does |
+|---|---|
+| `explain` | Runs no estimation and shows no approval. Sends a deterministic explanation of each action from templates and real values. Returns `explained`. |
+| `prepare` | Runs all checks plus a gas estimate. Shows a "prepared" card with the same details as an approval card but no Approve button. Returns `prepared`. |
+| `sign` | Auto-approved if all of these hold: every action is a transfer, every token has an enabled limit row, the batch fits all three limits, and every recipient is `user` or `contact`. Otherwise it asks via `approvals/registry.ts` (`requestApproval`, already built, with a timeout). |
+
+6.6 Explanations and card text come from templates in this layer, never from the model. For example: "Send 0.5 ETH to Darshan (0x1234…5678) on Sepolia. Estimated fee 0.00003 ETH." Fill the existing approval card types in `approvals/types.ts` (transfers with provenance, warnings, estimated fee; typed data with domain, message and known type).
+
+6.7 Execute approved actions in order with `wallet.transfer` / `wallet.signTypedData`. If one fails, stop the rest, mark them not executed, and report each action's outcome. A `reverted` or `pending` result is reported as such, not as success.
+
+6.8 Record every action in the `actions` table:
+- status transitions: proposed → approved / blocked / rejected / expired → signed / submitted → confirmed / failed
+- `approved_by` (user / auto), the tainted flag, tx hash, fee, and a sanitised error
+- Never store a signature
+
+The Activity page and `getHistory` read from this table.
+
+7. UI changes, kept minimal and in the current style:
+- Status lines for each outcome, with an Etherscan link for transactions.
+- A "prepared" card variant for prepare mode.
+- The explain output shown in chat.
+- A wallet-locked prompt when signing is needed.
+- Remove the "Nothing was run" line.
+- The approval card already exists; extend it only if a field is missing.
+
+8. Logging and privacy
+
+- Write to the audit log (`lib/logger.ts`): plan started/finished, validator failures, sandbox limit hits, each policy decision and its reason, approvals, executions.
+- Shorten addresses and hashes. Never log keys, seed phrases, passwords, signatures or raw prompts.
+- Messages shown to the user never contain private data from the encoder mapping beyond the user's own values.
+
+9. Tests (Vitest), with results written to `results/access-*.json` and a short `.md`
+
+Use a fake RPC, an in-memory database and a temporary keystore, as `tests/wallet` does. Cover:
+
+- **Legitimate:**
+  - single and batch transfers
+  - reads
+  - both spec examples end to end through the real sandbox
+  - auto-approval within limits
+  - approval required above limits
+- **Modes:** explain and prepare never sign or send, even when the code calls propose.
+- **Taint:**
+  - recipients from history, web pages and computation are never auto-approved
+  - user and contact recipients can be
+- **Policy:**
+  - another address in getBalance is rejected with no RPC call
+  - over-balance, over-limit (per transaction, daily, weekly) and batch totals
+  - a token not configured on the network
+  - an unknown contact name, and an ENS name with no address
+- **Typed data:** chain mismatch, signer mismatch, unknown type warning, never auto-approved.
+- **Sandbox attacks:**
+  - infinite loop, memory bomb, deep recursion
+  - prototype pollution, constructor and global access
+  - flooding host calls, huge `ui.show`, too many proposals
+  - mutating actions after propose: the executed action must equal the approved one
+- **Failures:**
+  - wallet locked, insufficient funds, a revert mid-batch (later actions not executed)
+  - approval timeout, session ended while paused
+- **Privacy:**
+  - nothing from results reaches the AI session
+  - logs contain no full addresses or secrets
+
+Report failures as well as successes, with a short reason for each failure.
+
+10. Constraints
+
+- TypeScript, in the existing modular monolith. Follow the repo's patterns: zod validation, globalThis singletons for in-memory state, redacted logging.
+- Read `AGENTS.md` and the bundled Next.js docs before touching routes.
+- No new dependencies unless needed. If one is needed, say which and why first.
+- Do not change the AI layer's output contract or the decoder's rules. If a change seems necessary, ask first.
+
+11. Before writing code
+
+Restate the plan, list the files to add or change, and ask me to confirm these defaults:
+
+a. Recipients may be saved contact names, resolved by the access layer.
+b. Auto-approval only for transfers to user or contact recipients within all three limits; typed data always asks.
+c. Stop the batch at the first failure.
+d. The limit numbers in section 4.
+e. Rolling 24-hour and 7-day windows, not calendar days.
+f. ENS lookups allowed despite the RPC privacy note.
+
+Deliverables: the `access/` source, pipeline and UI wiring, tests with results files, and a README section listing each check and where it is enforced.
+
+

@@ -1,0 +1,50 @@
+Text Encoder
+The Text Encoder acts as an intermediate layer between any input and the AI Layer. The main purpose of this layer is to sanitize the input text before it enters the LLM. This prevents any secrets from entering the LLM, which is the primary aim of this layer.
+The user enters a prompt through the user interface, which first goes to the Text Encoder for sanitization.
+Functions of Encoder at this stage:
+Takes the user input.
+Identifies the secrets that might be present in the user's prompt.
+Replaces the identified secrets with appropriate placeholders with proper numbering (like [PRIVATE_KEY_1], [PRIVATE_KEY_2], etc.).
+Outputs the sanitized text to the next layer (AI Layer).
+Identifiable Secrets:
+Wallet Address
+Private Keys
+Seed Phrases
+Apply proper pattern-matching algorithms (like REGEX) to find these secrets and replace them with the corresponding placeholders.
+Placeholder Format:
+Wallet Address: [WALLET_ADDRESS_N]
+Private Keys: [PRIVATE_KEY_N]
+Seed Phrases: [SEED_PHRASE_N]
+Examples:
+1. First Example:
+Original:
+Send 0.5 ETH from my wallet
+0x1234567890123456789012345678901234567890
+to 0xabcdefabcdefabcdefabcdefabcdefabcdefabcd.
+My private key is:
+0x1234567890123456789012345678901234567890123456789012345678901234
+Output after encoding:
+Send 0.5 ETH from my wallet
+[WALLET_ADDRESS_1]
+to [WALLET_ADDRESS_2].
+My private key is:
+[PRIVATE_KEY_1]
+Local Mapping:
+The Text Encoder should maintain a local mapping (stored in local memory securely, such that no one else can access it) similar to the following:
+{
+  "[WALLET_ADDRESS_1]": "0x1234567890123456789012345678901234567890",
+  "[WALLET_ADDRESS_2]": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+  "[PRIVATE_KEY_1]": "0x1234567890123456789012345678901234567890123456789012345678901234"
+}
+This mapping should never be passed to the LLM. This must be implemented through the system architecture.
+Regex Pattern Ordering:
+The regex patterns must be ordered from most specific to least specific:
+Private Key
+Wallet Address
+Seed Phrase
+Otherwise, overlapping patterns could cause incorrect classification.
+Also, because a private key is a 64-character hexadecimal value, make sure the wallet-address regex cannot match a substring inside it. Use proper boundaries and exclude already matched ranges.
+Important Design Principle:
+The Text Encoder is a deterministic layer that works on a fixed set of rules.
+
+

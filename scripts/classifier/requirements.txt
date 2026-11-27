@@ -1,0 +1,6 @@
+# Only for exporting and evaluating the classifier. The app itself runs it in Node.
+optimum-onnx[onnxruntime]
+torch
+transformers
+sentencepiece
+numpy
