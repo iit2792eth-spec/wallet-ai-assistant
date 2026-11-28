@@ -9,7 +9,8 @@
     "lint": "eslint",
     "test": "vitest run --exclude tests/ai/live.test.ts --reporter=default --reporter=json --outputFile=results/test-results.json",
     "test:live": "AI_LIVE=1 vitest run tests/ai/live.test.ts",
-    "test:access": "vitest run tests/access --reporter=default --reporter=json --outputFile=results/access-results.json; node scripts/results-md.mjs results/access-results.json results/access-results.md \"Access layer test results\""
+    "test:access": "vitest run tests/access --reporter=default --reporter=json --outputFile=results/access-results.json; node scripts/results-md.mjs results/access-results.json results/access-results.md \"Access layer test results\"",
+    "setup:classifier": "node scripts/classifier/download.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",

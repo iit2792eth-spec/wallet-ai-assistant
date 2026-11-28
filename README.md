@@ -14,7 +14,7 @@ Inter IIT Tech Meet 15.0.
 | AI layer | Built |
 | Text Encoder and Text Decoder | Built (`text-encoder/`, `text-decoder/`) |
 | Access layer (QuickJS sandbox, policy checks) | Built (`access/`) |
-| Wallet layer (keystore, viem) | Built (`wallet/`); Settings can create, import, unlock and lock a wallet and show balances. Not yet called by the access layer |
+| Wallet layer (keystore, viem, Uniswap v3) | Built (`wallet/`) |
 
 ## Setup
 
@@ -22,7 +22,8 @@ Requires Node.js 22 or later (developed on Node 26).
 
 ```bash
 npm install
-npm run dev          # http://localhost:3000
+npm run setup:classifier   # downloads and verifies the prompt-injection classifier (~740 MB, once)
+npm run dev                # http://localhost:3000
 ```
 
 The database (`data/app.db`) is created on first start from `db/schema.sql`.
@@ -33,16 +34,22 @@ is optional: leave it empty for OpenAI, Anthropic, Google, or Ollama on
 (e.g. an OpenAI-compatible server). Changing a model's provider or base URL
 removes its saved API key, so a key is never sent to a different host.
 
-Web pages, PDFs and pasted messages also need the prompt-injection classifier
-(739 MB, not in git). Export it once from the fine-tuned model in
-`v2_data_fix/model`:
+**The prompt-injection classifier** (ONNX, 739 MB) is not in git. Web pages, PDFs and pasted messages need it. `npm run setup:classifier` (`scripts/classifier/download.mjs`) downloads it from Hugging Face ([interiiteth/wallet-injection-classifier](https://huggingface.co/interiiteth/wallet-injection-classifier)) into `models/injection-classifier/`:
+- **Pinned:** the download is fixed to one Hugging Face commit, so a later change to that repo cannot change what you get.
+- **Verified:** every file is checked against a SHA-256 checksum kept in the script, and a file that does not match is refused.
+- **Simple:** it needs Node only, no Python and no Hugging Face account.
+- **Safe to re-run:** files already present and correct are skipped.
+
+The app itself never downloads anything; it loads those local files only. Without the classifier, typed requests work, but documents and pasted messages are refused (the check fails closed).
+
+To rebuild the export yourself instead, the same repo has the fine-tuned PyTorch weights in `pytorch/`. Download that folder to `v2_data_fix/model/`, then run:
 
 ```bash
 pip install -r scripts/classifier/requirements.txt
 sh scripts/classifier/export-onnx.sh   # writes models/injection-classifier/
 ```
 
-Without it, typed requests work but documents and pasted messages are refused.
+**HTTPS only** (Settings → Security) is on by default, so a model served over plain http, such as Ollama's default `http://localhost:11434`, is refused until you turn it off.
 
 ## AI layer
 

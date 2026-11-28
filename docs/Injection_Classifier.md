@@ -135,6 +135,12 @@ Raising the threshold to 0.2–0.5 would cut false alarms on help text further, 
 
 On an Apple M3 CPU, about 60–160 ms per sentence once the model is loaded. A short pasted message takes about 3 seconds, including the first model load. A 20,000-character page of about 200 sentences takes up to about 30 seconds.
 
+## Getting the model
+
+`npm run setup:classifier` downloads the ONNX export from Hugging Face ([interiiteth/wallet-injection-classifier](https://huggingface.co/interiiteth/wallet-injection-classifier)). It is pinned to one commit, and every file is checked against a SHA-256 checksum in `scripts/classifier/download.mjs`. The same repo holds the PyTorch weights in `pytorch/`, for re-exporting or checking the reports.
+
+After retraining, upload the new export and update `REVISION` and `FILES` (sizes and checksums) in `download.mjs`.
+
 ## Reproducing the numbers
 
 ```bash
